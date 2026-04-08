@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import requests
-from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
+from PySide6.QtCore import QProcess, QTimer, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,13 +45,6 @@ LOCAL_API_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
 DEFAULT_ADMIN_LOGIN = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"
 TUNNEL_EXE = "cloudflared.exe"
-DEFAULT_DB_HOST = "127.0.0.1"
-DEFAULT_DB_PORT = "5432"
-DEFAULT_DB_NAME = "service_bus"
-DEFAULT_DB_USER = "postgres"
-DEFAULT_DB_PASSWORD = "postgres"
-DEFAULT_JWT_SECRET = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
-DEFAULT_JWT_EXPIRE_MIN = "1440"
 
 
 # ======================================================
@@ -137,7 +130,6 @@ class MainWindow(QMainWindow):
         self.current_user_login: Optional[str] = None
         self.tunnel_process = QProcess(self)
         self.public_url: Optional[str] = None
-        self.server_bind_host = "0.0.0.0"
 
         self.server_process.readyReadStandardOutput.connect(self._read_server_stdout)
         self.server_process.readyReadStandardError.connect(self._read_server_stderr)
@@ -204,7 +196,6 @@ class MainWindow(QMainWindow):
         self.server_url = QLabel(LOCAL_API_BASE)
         server_layout.addRow("Статус:", self.server_status)
         server_layout.addRow("Локальный адрес:", self.server_url)
-        server_layout.addRow("Bind host:", QLabel(self.server_bind_host))
 
         network_box = QGroupBox("Сеть")
         network_layout = QFormLayout(network_box)
@@ -237,47 +228,11 @@ class MainWindow(QMainWindow):
         for button in [self.start_server_button, self.stop_server_button, self.start_tunnel_button, self.stop_tunnel_button]:
             actions_layout.addWidget(button)
 
-        config_box = self._build_server_config_box()
-
         layout.addWidget(server_box, 0, 0)
         layout.addWidget(network_box, 0, 1)
         layout.addWidget(auth_box, 0, 2)
         layout.addWidget(actions_box, 0, 3)
-        layout.addWidget(config_box, 1, 0, 1, 4)
         return widget
-
-    def _build_server_config_box(self) -> QWidget:
-        config_box = QGroupBox("Боевая конфигурация сервера (PostgreSQL)")
-        config_layout = QGridLayout(config_box)
-
-        self.db_host_input = QLineEdit(DEFAULT_DB_HOST)
-        self.db_port_input = QLineEdit(DEFAULT_DB_PORT)
-        self.db_name_input = QLineEdit(DEFAULT_DB_NAME)
-        self.db_user_input = QLineEdit(DEFAULT_DB_USER)
-        self.db_password_input = QLineEdit(DEFAULT_DB_PASSWORD)
-        self.db_password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.jwt_secret_input = QLineEdit(DEFAULT_JWT_SECRET)
-        self.jwt_expire_input = QLineEdit(DEFAULT_JWT_EXPIRE_MIN)
-
-        config_layout.addWidget(QLabel("DB host"), 0, 0)
-        config_layout.addWidget(self.db_host_input, 0, 1)
-        config_layout.addWidget(QLabel("DB port"), 0, 2)
-        config_layout.addWidget(self.db_port_input, 0, 3)
-
-        config_layout.addWidget(QLabel("DB name"), 1, 0)
-        config_layout.addWidget(self.db_name_input, 1, 1)
-        config_layout.addWidget(QLabel("DB user"), 1, 2)
-        config_layout.addWidget(self.db_user_input, 1, 3)
-
-        config_layout.addWidget(QLabel("DB password"), 2, 0)
-        config_layout.addWidget(self.db_password_input, 2, 1)
-        config_layout.addWidget(QLabel("JWT secret"), 2, 2)
-        config_layout.addWidget(self.jwt_secret_input, 2, 3)
-
-        config_layout.addWidget(QLabel("JWT expire (min)"), 3, 0)
-        config_layout.addWidget(self.jwt_expire_input, 3, 1)
-
-        return config_box
 
     def _build_bottom_tabs(self) -> QWidget:
         tabs = QTabWidget()
@@ -413,58 +368,11 @@ class MainWindow(QMainWindow):
         return widget
 
     # ---------------- Server/Tunnel ----------------
-    def _build_database_url(self) -> str:
-        host = self.db_host_input.text().strip()
-        port = self.db_port_input.text().strip()
-        name = self.db_name_input.text().strip()
-        user = self.db_user_input.text().strip()
-        password = self.db_password_input.text()
-        return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
-
-    def _masked_database_url(self) -> str:
-        host = self.db_host_input.text().strip()
-        port = self.db_port_input.text().strip()
-        name = self.db_name_input.text().strip()
-        user = self.db_user_input.text().strip()
-        return f"postgresql+psycopg2://{user}:***@{host}:{port}/{name}"
-
-    def _validate_server_config(self) -> Optional[str]:
-        required_fields = {
-            "DB host": self.db_host_input.text().strip(),
-            "DB port": self.db_port_input.text().strip(),
-            "DB name": self.db_name_input.text().strip(),
-            "DB user": self.db_user_input.text().strip(),
-            "DB password": self.db_password_input.text(),
-            "JWT secret": self.jwt_secret_input.text().strip(),
-            "JWT expire": self.jwt_expire_input.text().strip(),
-        }
-        for label, value in required_fields.items():
-            if not value:
-                return f"Поле '{label}' обязательно"
-        if not self.db_port_input.text().strip().isdigit():
-            return "DB port должен быть числом"
-        if not self.jwt_expire_input.text().strip().isdigit():
-            return "JWT expire (min) должен быть числом"
-        return None
-
     def start_server(self) -> None:
         if self.server_process.state() != QProcess.ProcessState.NotRunning:
             self._append_system_log("[СЕРВЕР] Сервер уже запущен")
             return
-        config_error = self._validate_server_config()
-        if config_error:
-            QMessageBox.warning(self, "Конфигурация", config_error)
-            return
-
-        database_url = self._build_database_url()
-        self._append_system_log("[СЕРВЕР] Режим: PostgreSQL")
-        self._append_system_log(f"[СЕРВЕР] DATABASE_URL: {self._masked_database_url()}")
         self._append_system_log("[СЕРВЕР] Запуск FastAPI...")
-        process_env = QProcessEnvironment.systemEnvironment()
-        process_env.insert("DATABASE_URL", database_url)
-        process_env.insert("JWT_SECRET_KEY", self.jwt_secret_input.text().strip())
-        process_env.insert("ACCESS_TOKEN_EXPIRE_MINUTES", self.jwt_expire_input.text().strip())
-        self.server_process.setProcessEnvironment(process_env)
         self.server_process.start(
             sys.executable,
             [
@@ -472,7 +380,7 @@ class MainWindow(QMainWindow):
                 "uvicorn",
                 "service_bus_backend_main:app",
                 "--host",
-                self.server_bind_host,
+                "0.0.0.0",
                 "--port",
                 str(SERVER_PORT),
             ],
