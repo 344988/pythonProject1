@@ -108,6 +108,21 @@ class ApiSession:
         response.raise_for_status()
         return response.json()
 
+    def get_roles(self) -> list[dict[str, Any]]:
+        response = requests.get(f"{self.base_url}/admin/roles", headers=self.headers(), timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    def create_role(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/admin/roles",
+            headers={**self.headers(), "Content-Type": "application/json"},
+            data=json.dumps(payload, ensure_ascii=False),
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_logs(self) -> list[dict[str, Any]]:
         response = requests.get(f"{self.base_url}/admin/logs", headers=self.headers(), timeout=10)
         response.raise_for_status()
@@ -283,6 +298,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_dashboard_tab(), "Панель")
         tabs.addTab(self._build_users_tab(), "Пользователи")
+        tabs.addTab(self._build_roles_tab(), "Роли")
         tabs.addTab(self._build_logs_tab(), "Логи")
         tabs.addTab(self._build_network_tab(), "Сеть")
         return tabs
@@ -306,7 +322,6 @@ class MainWindow(QMainWindow):
         self.new_password = QLineEdit()
         self.new_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.new_role = QComboBox()
-        self.new_role.addItems(["admin", "driver", "passenger"])
         self.new_vehicle = QLineEdit()
         self.new_plate = QLineEdit()
         self.new_active = QCheckBox()
@@ -398,6 +413,33 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(buttons_layout)
         layout.addWidget(self.logs_table)
+        return widget
+
+    def _build_roles_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        form_layout = QGridLayout()
+        self.new_role_code_input = QLineEdit()
+        self.new_role_desc_input = QLineEdit()
+        add_role_button = QPushButton("Добавить роль")
+        add_role_button.clicked.connect(self.create_role)
+        load_roles_button = QPushButton("Обновить роли")
+        load_roles_button.clicked.connect(self.load_roles)
+
+        form_layout.addWidget(QLabel("Код роли"), 0, 0)
+        form_layout.addWidget(self.new_role_code_input, 0, 1)
+        form_layout.addWidget(QLabel("Описание"), 0, 2)
+        form_layout.addWidget(self.new_role_desc_input, 0, 3)
+        form_layout.addWidget(add_role_button, 0, 4)
+        form_layout.addWidget(load_roles_button, 0, 5)
+
+        self.roles_table = QTableWidget(0, 3)
+        self.roles_table.setHorizontalHeaderLabels(["Код", "Описание", "Системная"])
+        self.roles_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.roles_table)
         return widget
 
     def _build_network_tab(self) -> QWidget:
@@ -563,12 +605,53 @@ class MainWindow(QMainWindow):
             self._append_system_log(f"[USERS] Ошибка загрузки пользователей: {exc}")
             QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить пользователей:\n{exc}")
 
+    def load_roles(self) -> None:
+        try:
+            rows = self.api.get_roles()
+            self.roles_table.setRowCount(len(rows))
+            self.new_role.blockSignals(True)
+            self.new_role.clear()
+            for row_index, role in enumerate(rows):
+                self.new_role.addItem(role.get("code", ""))
+                values = [
+                    role.get("code", ""),
+                    role.get("description") or "",
+                    "Да" if role.get("is_system") else "Нет",
+                ]
+                for col, value in enumerate(values):
+                    self.roles_table.setItem(row_index, col, QTableWidgetItem(str(value)))
+            self.new_role.blockSignals(False)
+            self._append_system_log(f"[ROLES] Загружено ролей: {len(rows)}")
+        except Exception as exc:
+            self._append_system_log(f"[ROLES] Ошибка загрузки ролей: {exc}")
+            QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить роли:\n{exc}")
+
+    def create_role(self) -> None:
+        code = self.new_role_code_input.text().strip().lower()
+        if not code:
+            QMessageBox.warning(self, "Роли", "Укажите код роли")
+            return
+        payload = {"code": code, "description": self.new_role_desc_input.text().strip() or None}
+        try:
+            self.api.create_role(payload)
+            self._append_system_log(f"[ROLES] Добавлена роль: {code}")
+            self.new_role_code_input.clear()
+            self.new_role_desc_input.clear()
+            self.load_roles()
+        except Exception as exc:
+            self._append_system_log(f"[ROLES] Ошибка создания роли: {exc}")
+            QMessageBox.warning(self, "Ошибка", f"Не удалось добавить роль:\n{exc}")
+
     def create_user(self) -> None:
         try:
+            role_value = self.new_role.currentText().strip()
+            if not role_value:
+                QMessageBox.warning(self, "Пользователи", "Сначала загрузите и выберите роль")
+                return
             payload = {
                 "login": self.new_login.text().strip(),
                 "password": self.new_password.text(),
-                "role": self.new_role.currentText(),
+                "role": role_value,
                 "vehicle_model": self.new_vehicle.text().strip() or None,
                 "license_plate": self.new_plate.text().strip() or None,
                 "is_active": self.new_active.isChecked(),
@@ -668,6 +751,7 @@ class MainWindow(QMainWindow):
     def refresh_all(self) -> None:
         self.refresh_health_status()
         if self.api.token:
+            self.load_roles()
             self.load_users()
             self.load_logs()
 
