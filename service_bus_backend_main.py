@@ -33,7 +33,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 # =========================
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/service_bus",
+    "sqlite:///./service_bus.db",
 )
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -52,6 +53,7 @@ DEFAULT_DB_USER = "postgres"
 DEFAULT_DB_PASSWORD = "postgres"
 DEFAULT_JWT_SECRET = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 DEFAULT_JWT_EXPIRE_MIN = "1440"
+DEFAULT_SQLITE_PATH = "./service_bus.db"
 
 
 # ======================================================
@@ -262,9 +264,13 @@ class MainWindow(QMainWindow):
         return widget
 
     def _build_server_config_box(self) -> QWidget:
-        config_box = QGroupBox("Боевая конфигурация сервера (PostgreSQL)")
+        config_box = QGroupBox("Конфигурация сервера (PostgreSQL / SQLite)")
         config_layout = QGridLayout(config_box)
 
+        self.db_mode_input = QComboBox()
+        self.db_mode_input.addItems(["PostgreSQL", "SQLite"])
+        self.db_mode_input.currentTextChanged.connect(self._update_db_mode_fields)
+        self.sqlite_path_input = QLineEdit(DEFAULT_SQLITE_PATH)
         self.db_host_input = QLineEdit(DEFAULT_DB_HOST)
         self.db_port_input = QLineEdit(DEFAULT_DB_PORT)
         self.db_name_input = QLineEdit(DEFAULT_DB_NAME)
@@ -274,23 +280,29 @@ class MainWindow(QMainWindow):
         self.jwt_secret_input = QLineEdit(DEFAULT_JWT_SECRET)
         self.jwt_expire_input = QLineEdit(DEFAULT_JWT_EXPIRE_MIN)
 
-        config_layout.addWidget(QLabel("DB host"), 0, 0)
-        config_layout.addWidget(self.db_host_input, 0, 1)
-        config_layout.addWidget(QLabel("DB port"), 0, 2)
-        config_layout.addWidget(self.db_port_input, 0, 3)
+        config_layout.addWidget(QLabel("DB mode"), 0, 0)
+        config_layout.addWidget(self.db_mode_input, 0, 1)
+        config_layout.addWidget(QLabel("SQLite path"), 0, 2)
+        config_layout.addWidget(self.sqlite_path_input, 0, 3)
 
-        config_layout.addWidget(QLabel("DB name"), 1, 0)
-        config_layout.addWidget(self.db_name_input, 1, 1)
-        config_layout.addWidget(QLabel("DB user"), 1, 2)
-        config_layout.addWidget(self.db_user_input, 1, 3)
+        config_layout.addWidget(QLabel("DB host"), 1, 0)
+        config_layout.addWidget(self.db_host_input, 1, 1)
+        config_layout.addWidget(QLabel("DB port"), 1, 2)
+        config_layout.addWidget(self.db_port_input, 1, 3)
 
-        config_layout.addWidget(QLabel("DB password"), 2, 0)
-        config_layout.addWidget(self.db_password_input, 2, 1)
-        config_layout.addWidget(QLabel("JWT secret"), 2, 2)
-        config_layout.addWidget(self.jwt_secret_input, 2, 3)
+        config_layout.addWidget(QLabel("DB name"), 2, 0)
+        config_layout.addWidget(self.db_name_input, 2, 1)
+        config_layout.addWidget(QLabel("DB user"), 2, 2)
+        config_layout.addWidget(self.db_user_input, 2, 3)
 
-        config_layout.addWidget(QLabel("JWT expire (min)"), 3, 0)
-        config_layout.addWidget(self.jwt_expire_input, 3, 1)
+        config_layout.addWidget(QLabel("DB password"), 3, 0)
+        config_layout.addWidget(self.db_password_input, 3, 1)
+        config_layout.addWidget(QLabel("JWT secret"), 3, 2)
+        config_layout.addWidget(self.jwt_secret_input, 3, 3)
+
+        config_layout.addWidget(QLabel("JWT expire (min)"), 4, 0)
+        config_layout.addWidget(self.jwt_expire_input, 4, 1)
+        self._update_db_mode_fields()
 
         return config_box
 
@@ -456,6 +468,8 @@ class MainWindow(QMainWindow):
 
     # ---------------- Server/Tunnel ----------------
     def _build_database_url(self) -> str:
+        if self.db_mode_input.currentText() == "SQLite":
+            return f"sqlite:///{self.sqlite_path_input.text().strip()}"
         host = self.db_host_input.text().strip()
         port = self.db_port_input.text().strip()
         name = self.db_name_input.text().strip()
@@ -464,29 +478,55 @@ class MainWindow(QMainWindow):
         return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
 
     def _masked_database_url(self) -> str:
+        if self.db_mode_input.currentText() == "SQLite":
+            return f"sqlite:///{self.sqlite_path_input.text().strip()}"
         host = self.db_host_input.text().strip()
         port = self.db_port_input.text().strip()
         name = self.db_name_input.text().strip()
         user = self.db_user_input.text().strip()
         return f"postgresql+psycopg2://{user}:***@{host}:{port}/{name}"
 
+    def _update_db_mode_fields(self) -> None:
+        is_postgres = self.db_mode_input.currentText() == "PostgreSQL"
+        for widget in [self.db_host_input, self.db_port_input, self.db_name_input, self.db_user_input, self.db_password_input]:
+            widget.setEnabled(is_postgres)
+        self.sqlite_path_input.setEnabled(not is_postgres)
+
+    def _is_tcp_open(self, host: str, port: int, timeout: float = 1.5) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     def _validate_server_config(self) -> Optional[str]:
+        mode = self.db_mode_input.currentText()
         required_fields = {
-            "DB host": self.db_host_input.text().strip(),
-            "DB port": self.db_port_input.text().strip(),
-            "DB name": self.db_name_input.text().strip(),
-            "DB user": self.db_user_input.text().strip(),
-            "DB password": self.db_password_input.text(),
             "JWT secret": self.jwt_secret_input.text().strip(),
             "JWT expire": self.jwt_expire_input.text().strip(),
         }
+        if mode == "PostgreSQL":
+            required_fields.update({
+                "DB host": self.db_host_input.text().strip(),
+                "DB port": self.db_port_input.text().strip(),
+                "DB name": self.db_name_input.text().strip(),
+                "DB user": self.db_user_input.text().strip(),
+                "DB password": self.db_password_input.text(),
+            })
+        else:
+            required_fields["SQLite path"] = self.sqlite_path_input.text().strip()
         for label, value in required_fields.items():
             if not value:
                 return f"Поле '{label}' обязательно"
-        if not self.db_port_input.text().strip().isdigit():
+        if mode == "PostgreSQL" and not self.db_port_input.text().strip().isdigit():
             return "DB port должен быть числом"
         if not self.jwt_expire_input.text().strip().isdigit():
             return "JWT expire (min) должен быть числом"
+        if mode == "PostgreSQL":
+            host = self.db_host_input.text().strip()
+            port = int(self.db_port_input.text().strip())
+            if not self._is_tcp_open(host, port):
+                return f"Нет соединения с PostgreSQL {host}:{port}. Запустите PostgreSQL или выберите SQLite."
         return None
 
     def start_server(self) -> None:
@@ -499,7 +539,7 @@ class MainWindow(QMainWindow):
             return
 
         database_url = self._build_database_url()
-        self._append_system_log("[СЕРВЕР] Режим: PostgreSQL")
+        self._append_system_log(f"[СЕРВЕР] Режим: {self.db_mode_input.currentText()}")
         self._append_system_log(f"[СЕРВЕР] DATABASE_URL: {self._masked_database_url()}")
         self._append_system_log("[СЕРВЕР] Запуск FastAPI...")
         process_env = QProcessEnvironment.systemEnvironment()
