@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -30,13 +31,13 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 # =========================
 # CONFIG
 # =========================
-DATABASE_URL = "sqlite:///./service_bus.db"
-# Для PostgreSQL:
-# DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/service_bus"
-
-JWT_SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
-JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./service_bus.db",
+)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(60 * 24)))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -54,10 +55,10 @@ engine = create_engine(DATABASE_URL, echo=False, future=True, connect_args=conne
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
-class UserRole(str, Enum):
-    admin = "admin"
-    driver = "driver"
-    passenger = "passenger"
+ROLE_ADMIN = "admin"
+ROLE_DRIVER = "driver"
+ROLE_PASSENGER = "passenger"
+ROLE_CUSTOMER = "customer"
 
 
 class RouteStatus(str, Enum):
@@ -72,13 +73,24 @@ class LogLevel(str, Enum):
     success = "success"
 
 
+class RequestStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
+class CustomerKind(str, Enum):
+    person = "person"
+    company = "company"
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     login: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     vehicle_model: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     license_plate: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -89,6 +101,44 @@ class User(Base):
     routes: Mapped[list["ActiveRoute"]] = relationship(back_populates="driver", cascade="all, delete-orphan")
     location: Mapped[Optional["Location"]] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
     logs: Mapped[list["SystemLog"]] = relationship(back_populates="user")
+    requests: Mapped[list["BusRequest"]] = relationship(
+        back_populates="requester",
+        foreign_keys="BusRequest.requester_id",
+    )
+    processed_requests: Mapped[list["BusRequest"]] = relationship(
+        back_populates="processor",
+        foreign_keys="BusRequest.processed_by",
+    )
+
+
+class UserRoleEntry(Base):
+    __tablename__ = "user_roles"
+
+    code: Mapped[str] = mapped_column(String(100), primary_key=True)
+    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class BusRequest(Base):
+    __tablename__ = "bus_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    requester_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    requester_kind: Mapped[CustomerKind] = mapped_column(SAEnum(CustomerKind), nullable=False)
+    company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    route_from: Mapped[str] = mapped_column(String(255), nullable=False)
+    route_to: Mapped[str] = mapped_column(String(255), nullable=False)
+    trip_time: Mapped[str] = mapped_column(String(100), nullable=False)
+    passenger_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    comment: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    status: Mapped[RequestStatus] = mapped_column(SAEnum(RequestStatus), nullable=False, default=RequestStatus.pending, index=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    processed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    requester: Mapped[User] = relationship(back_populates="requests", foreign_keys=[requester_id])
+    processor: Mapped[Optional[User]] = relationship(back_populates="processed_requests", foreign_keys=[processed_by])
 
 
 class ActiveRoute(Base):
@@ -157,7 +207,7 @@ class SystemLog(Base):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    role: UserRole
+    role: str
     user_id: int
     login: str
 
@@ -165,7 +215,7 @@ class TokenResponse(BaseModel):
 class UserCreate(BaseModel):
     login: str = Field(..., min_length=1, max_length=100)
     password: str = Field(..., min_length=4, max_length=128)
-    role: UserRole
+    role: str = Field(..., min_length=1, max_length=100)
     vehicle_model: Optional[str] = None
     license_plate: Optional[str] = None
     is_active: bool = True
@@ -175,7 +225,7 @@ class UserCreate(BaseModel):
 
 
 class UserPermissionsUpdate(BaseModel):
-    role: Optional[UserRole] = None
+    role: Optional[str] = None
     is_active: Optional[bool] = None
     can_track: Optional[bool] = None
     can_manage_users: Optional[bool] = None
@@ -189,7 +239,7 @@ class UserRead(BaseModel):
 
     id: int
     login: str
-    role: UserRole
+    role: str
     vehicle_model: Optional[str]
     license_plate: Optional[str]
     is_active: bool
@@ -271,6 +321,54 @@ class MessageResponse(BaseModel):
     message: str
 
 
+class RoleCreate(BaseModel):
+    code: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=255)
+
+
+class RoleRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    description: Optional[str]
+    is_system: bool
+
+
+class BusRequestCreate(BaseModel):
+    requester_kind: CustomerKind
+    company_name: Optional[str] = Field(default=None, max_length=255)
+    route_from: str = Field(..., min_length=1, max_length=255)
+    route_to: str = Field(..., min_length=1, max_length=255)
+    trip_time: str = Field(..., min_length=1, max_length=100)
+    passenger_count: int = Field(..., ge=1, le=10000)
+    comment: Optional[str] = Field(default=None, max_length=1000)
+
+
+class BusRequestRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    requester_id: int
+    requester_login: str
+    requester_kind: CustomerKind
+    company_name: Optional[str]
+    route_from: str
+    route_to: str
+    trip_time: str
+    passenger_count: int
+    comment: Optional[str]
+    status: RequestStatus
+    rejection_reason: Optional[str]
+    processed_by: Optional[int]
+    processed_by_login: Optional[str]
+    created_at: datetime
+    processed_at: Optional[datetime]
+
+
+class BusRequestDecision(BaseModel):
+    rejection_reason: Optional[str] = Field(default=None, max_length=1000)
+
+
 # =========================
 # UTILS
 # =========================
@@ -303,6 +401,10 @@ def get_user_by_login(db: Session, login: str) -> Optional[User]:
 
 def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
     return db.get(User, user_id)
+
+
+def get_role_by_code(db: Session, code: str) -> Optional[UserRoleEntry]:
+    return db.get(UserRoleEntry, code)
 
 
 def create_log(
@@ -355,7 +457,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
-def require_role(*roles: UserRole):
+def require_role(*roles: str):
     def checker(current_user: User = Depends(get_current_user)) -> User:
         if current_user.role not in roles:
             raise HTTPException(
@@ -368,7 +470,7 @@ def require_role(*roles: UserRole):
 
 
 def require_log_access(current_user: User = Depends(get_current_user)) -> User:
-    if current_user.role == UserRole.admin or current_user.can_view_logs:
+    if current_user.role == ROLE_ADMIN or current_user.can_view_logs:
         return current_user
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -384,13 +486,24 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
 
     with SessionLocal() as db:
+        default_roles = [
+            (ROLE_ADMIN, "Администратор"),
+            (ROLE_DRIVER, "Водитель"),
+            (ROLE_PASSENGER, "Пассажир"),
+            (ROLE_CUSTOMER, "Заказчик"),
+        ]
+        for code, description in default_roles:
+            if not get_role_by_code(db, code):
+                db.add(UserRoleEntry(code=code, description=description, is_system=True))
+        db.commit()
+
         admin = get_user_by_login(db, "admin")
         if not admin:
             db.add(
                 User(
                     login="admin",
                     password_hash=hash_password("admin123"),
-                    role=UserRole.admin,
+                    role=ROLE_ADMIN,
                     is_active=True,
                     can_track=True,
                     can_manage_users=True,
@@ -539,7 +652,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             detail="Неверный логин или пароль",
         )
 
-    access_token = create_access_token({"sub": str(user.id), "role": user.role.value})
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
     create_log(db, LogLevel.success, "auth", f"Успешный вход пользователя {user.login}", user_id=user.id)
 
     return TokenResponse(
@@ -562,7 +675,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 )
 def admin_list_users(
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin)),
+    _: User = Depends(require_role(ROLE_ADMIN)),
 ):
     users = db.scalars(select(User).order_by(User.id)).all()
     return [UserRead.model_validate(user) for user in users]
@@ -579,7 +692,7 @@ def admin_list_users(
 def admin_create_user(
     payload: UserCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin)),
+    _: User = Depends(require_role(ROLE_ADMIN)),
 ):
     existing = get_user_by_login(db, payload.login)
     if existing:
@@ -588,14 +701,18 @@ def admin_create_user(
             detail="Пользователь с таким логином уже существует",
         )
 
+    role = payload.role.strip().lower()
+    if not get_role_by_code(db, role):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Указанная роль не зарегистрирована")
+
     license_plate = payload.license_plate
-    if payload.role == UserRole.driver and not license_plate:
+    if role == ROLE_DRIVER and not license_plate:
         license_plate = payload.login
 
     new_user = User(
         login=payload.login,
         password_hash=hash_password(payload.password),
-        role=payload.role,
+        role=role,
         vehicle_model=payload.vehicle_model,
         license_plate=license_plate,
         is_active=payload.is_active,
@@ -622,14 +739,17 @@ def admin_update_user_permissions(
     user_id: int,
     payload: UserPermissionsUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin)),
+    _: User = Depends(require_role(ROLE_ADMIN)),
 ):
     user = get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
 
     if payload.role is not None:
-        user.role = payload.role
+        next_role = payload.role.strip().lower()
+        if not get_role_by_code(db, next_role):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Указанная роль не зарегистрирована")
+        user.role = next_role
     if payload.is_active is not None:
         user.is_active = payload.is_active
     if payload.can_track is not None:
@@ -660,7 +780,7 @@ def admin_update_user_permissions(
 def admin_delete_user(
     user_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin)),
+    _: User = Depends(require_role(ROLE_ADMIN)),
 ):
     user = get_user_by_id(db, user_id)
     if not user:
@@ -672,6 +792,48 @@ def admin_delete_user(
 
     create_log(db, LogLevel.warning, "admin.users", f"Удален пользователь {login}")
     return MessageResponse(message="Пользователь удален")
+
+
+@app.get(
+    "/admin/roles",
+    response_model=list[RoleRead],
+    tags=["Администрирование"],
+    summary="Получить список ролей",
+    description="Возвращает зарегистрированные роли пользователей.",
+)
+def admin_list_roles(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(ROLE_ADMIN)),
+):
+    rows = db.scalars(select(UserRoleEntry).order_by(UserRoleEntry.code)).all()
+    return [RoleRead.model_validate(row) for row in rows]
+
+
+@app.post(
+    "/admin/roles",
+    response_model=RoleRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Администрирование"],
+    summary="Добавить новую роль",
+    description="Создает новую роль, которую можно использовать при создании пользователей.",
+)
+def admin_create_role(
+    payload: RoleCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(ROLE_ADMIN)),
+):
+    code = payload.code.strip().lower()
+    if not code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Код роли не может быть пустым")
+    if get_role_by_code(db, code):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Роль уже существует")
+
+    role = UserRoleEntry(code=code, description=payload.description, is_system=False)
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    create_log(db, LogLevel.success, "admin.roles", f"Добавлена роль {code}", user_id=current_user.id)
+    return RoleRead.model_validate(role)
 
 
 # =========================
@@ -764,7 +926,7 @@ def admin_create_log(
 def start_route(
     payload: RouteStartRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.driver)),
+    current_user: User = Depends(require_role(ROLE_DRIVER)),
 ):
     if not current_user.can_track:
         raise HTTPException(
@@ -819,7 +981,7 @@ def start_route(
 )
 def finish_route(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.driver)),
+    current_user: User = Depends(require_role(ROLE_DRIVER)),
 ):
     route = db.scalar(
         select(ActiveRoute).where(
@@ -857,7 +1019,7 @@ def finish_route(
 def update_location(
     payload: LocationUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(UserRole.driver)),
+    current_user: User = Depends(require_role(ROLE_DRIVER)),
 ):
     if not current_user.can_track:
         raise HTTPException(
@@ -926,7 +1088,7 @@ def update_location(
 )
 def get_active_routes(
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin, UserRole.driver, UserRole.passenger)),
+    _: User = Depends(require_role(ROLE_ADMIN, ROLE_DRIVER, ROLE_PASSENGER, ROLE_CUSTOMER)),
 ):
     routes = db.scalars(
         select(ActiveRoute)
@@ -963,10 +1125,10 @@ def get_active_routes(
 def get_driver_location(
     user_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(require_role(UserRole.admin, UserRole.driver, UserRole.passenger)),
+    _: User = Depends(require_role(ROLE_ADMIN, ROLE_DRIVER, ROLE_PASSENGER, ROLE_CUSTOMER)),
 ):
     user = get_user_by_id(db, user_id)
-    if not user or user.role != UserRole.driver:
+    if not user or user.role != ROLE_DRIVER:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Водитель не найден")
 
     active_route = db.scalar(
@@ -996,6 +1158,129 @@ def get_driver_location(
     )
 
 
+def _to_bus_request_read(item: BusRequest) -> BusRequestRead:
+    return BusRequestRead(
+        id=item.id,
+        requester_id=item.requester_id,
+        requester_login=item.requester.login,
+        requester_kind=item.requester_kind,
+        company_name=item.company_name,
+        route_from=item.route_from,
+        route_to=item.route_to,
+        trip_time=item.trip_time,
+        passenger_count=item.passenger_count,
+        comment=item.comment,
+        status=item.status,
+        rejection_reason=item.rejection_reason,
+        processed_by=item.processed_by,
+        processed_by_login=item.processor.login if item.processor else None,
+        created_at=item.created_at,
+        processed_at=item.processed_at,
+    )
+
+
+@app.post(
+    "/requests",
+    response_model=BusRequestRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Пассажир"],
+    summary="Создать заявку на автобус",
+    description="Заказчик (частное лицо или компания) создает заявку, которую администратор может принять или отклонить.",
+)
+def create_bus_request(
+    payload: BusRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(ROLE_CUSTOMER, ROLE_ADMIN)),
+):
+    if payload.requester_kind == CustomerKind.company and not (payload.company_name or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Для компании укажите название")
+
+    item = BusRequest(
+        requester_id=current_user.id,
+        requester_kind=payload.requester_kind,
+        company_name=(payload.company_name or "").strip() or None,
+        route_from=payload.route_from,
+        route_to=payload.route_to,
+        trip_time=payload.trip_time,
+        passenger_count=payload.passenger_count,
+        comment=payload.comment,
+        status=RequestStatus.pending,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    create_log(db, LogLevel.info, "requests", f"Новая заявка #{item.id}", user_id=current_user.id)
+    return _to_bus_request_read(item)
+
+
+@app.get(
+    "/admin/requests",
+    response_model=list[BusRequestRead],
+    tags=["Администрирование"],
+    summary="Список заявок",
+    description="Получить список заявок. По умолчанию — только pending.",
+)
+def admin_list_bus_requests(
+    status_filter: Optional[RequestStatus] = RequestStatus.pending,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(ROLE_ADMIN)),
+):
+    query = select(BusRequest).order_by(desc(BusRequest.created_at))
+    if status_filter is not None:
+        query = query.where(BusRequest.status == status_filter)
+    rows = db.scalars(query).all()
+    return [_to_bus_request_read(item) for item in rows]
+
+
+@app.post(
+    "/admin/requests/{request_id}/approve",
+    response_model=BusRequestRead,
+    tags=["Администрирование"],
+    summary="Принять заявку",
+)
+def admin_approve_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(ROLE_ADMIN)),
+):
+    item = db.get(BusRequest, request_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Заявка не найдена")
+    item.status = RequestStatus.approved
+    item.rejection_reason = None
+    item.processed_by = current_user.id
+    item.processed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(item)
+    create_log(db, LogLevel.success, "requests", f"Заявка #{item.id} одобрена", user_id=current_user.id)
+    return _to_bus_request_read(item)
+
+
+@app.post(
+    "/admin/requests/{request_id}/reject",
+    response_model=BusRequestRead,
+    tags=["Администрирование"],
+    summary="Отклонить заявку",
+)
+def admin_reject_request(
+    request_id: int,
+    payload: BusRequestDecision,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(ROLE_ADMIN)),
+):
+    item = db.get(BusRequest, request_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Заявка не найдена")
+    item.status = RequestStatus.rejected
+    item.rejection_reason = (payload.rejection_reason or "").strip() or "Без комментария"
+    item.processed_by = current_user.id
+    item.processed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(item)
+    create_log(db, LogLevel.warning, "requests", f"Заявка #{item.id} отклонена", user_id=current_user.id)
+    return _to_bus_request_read(item)
+
+
 # =========================
 # SYSTEM
 # =========================
@@ -1017,7 +1302,7 @@ def healthcheck():
 # uvicorn service_bus_backend_main:app --reload
 #
 # Зависимости:
-# pip install fastapi uvicorn sqlalchemy python-jose[cryptography] passlib[bcrypt] bcrypt==4.0.1 python-multipart
+# pip install fastapi uvicorn sqlalchemy psycopg2-binary python-jose[cryptography] passlib[bcrypt] bcrypt==4.0.1 python-multipart
 #
 # Важно:
 # если у вас старая база и проблемы со входом, удалите service_bus.db и запустите сервер заново.
