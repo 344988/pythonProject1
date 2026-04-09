@@ -45,7 +45,7 @@ SERVER_PORT = 8000
 LOCAL_API_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
 DEFAULT_ADMIN_LOGIN = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"
-TUNNEL_EXE = "cloudflared.exe"
+# TUNNEL_EXE = "cloudflared.exe"  # использование cloudflared отключено
 DEFAULT_DB_HOST = "127.0.0.1"
 DEFAULT_DB_PORT = "5432"
 DEFAULT_DB_NAME = "service_bus"
@@ -578,27 +578,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Сервер остановлен")
 
     def start_tunnel(self) -> None:
-        if self.tunnel_process.state() != QProcess.ProcessState.NotRunning:
-            self._append_system_log("[СЕТЬ] Туннель уже запущен")
-            return
-        self._append_system_log("[СЕТЬ] Открытие внешнего доступа через cloudflared...")
-        self.tunnel_process.start(TUNNEL_EXE, ["tunnel", "--url", LOCAL_API_BASE])
-        started = self.tunnel_process.waitForStarted(5000)
-        if not started:
-            QMessageBox.critical(
-                self,
-                "Ошибка",
-                "Не удалось запустить cloudflared. Проверьте, что cloudflared.exe лежит рядом с приложением.",
-            )
-            self._append_system_log("[СЕТЬ] Не удалось запустить cloudflared.exe")
+        self._append_system_log("[СЕТЬ] Запуск cloudflared отключен. Используйте белый IP и открытый порт 8000.")
+        QMessageBox.information(
+            self,
+            "Сеть",
+            "Использование cloudflared отключено. Для внешнего доступа используйте белый IP и открытый порт 8000.",
+        )
 
     def stop_tunnel(self) -> None:
-        if self.tunnel_process.state() == QProcess.ProcessState.NotRunning:
-            self._append_system_log("[СЕТЬ] Туннель уже остановлен")
-            return
-        self.tunnel_process.terminate()
-        if not self.tunnel_process.waitForFinished(5000):
-            self.tunnel_process.kill()
+        self._append_system_log("[СЕТЬ] cloudflared отключен, останавливать нечего.")
         self.public_url = None
         self.public_url_label.setText("Не опубликован")
         self.network_public.setText("Не опубликован")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -8,8 +9,9 @@ from typing import Any, Generator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, ConfigDict, Field
@@ -38,9 +40,21 @@ DATABASE_URL = os.getenv(
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(60 * 24)))
+SERVER_PORT = int(os.getenv("PORT", "8000"))
+PUBLIC_IP = os.getenv("PUBLIC_IP", "37.200.79.56")
+BASE_URL = os.getenv("BASE_URL", f"http://{PUBLIC_IP}:{SERVER_PORT}")
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(1024 * 1024)))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "120"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+logger = logging.getLogger("service_bus")
+if not logger.handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
 
 
 # =========================
@@ -321,6 +335,11 @@ class MessageResponse(BaseModel):
     message: str
 
 
+class HealthResponse(BaseModel):
+    status: str
+    base_url: str
+
+
 class RoleCreate(BaseModel):
     code: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = Field(default=None, max_length=255)
@@ -378,6 +397,9 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+REQUEST_TIMESTAMPS_BY_IP: dict[str, list[datetime]] = {}
 
 
 def hash_password(password: str) -> str:
@@ -532,6 +554,32 @@ app = FastAPI(
     ],
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": str(exc.detail), "code": "HTTP_ERROR"},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    client_ip = request.client.host if request.client else "unknown"
+    logger.exception("Unhandled exception from %s on %s", client_ip, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"error": "Внутренняя ошибка сервера", "code": "INTERNAL_SERVER_ERROR"},
+    )
+
 
 @app.get("/docs", include_in_schema=False)
 def custom_swagger_ui_html() -> HTMLResponse:
@@ -607,28 +655,50 @@ def custom_swagger_ui_html() -> HTMLResponse:
 
 @app.middleware("http")
 async def request_log_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={"error": "Слишком большой запрос", "code": "REQUEST_TOO_LARGE"},
+        )
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+    ip_events = [t for t in REQUEST_TIMESTAMPS_BY_IP.get(client_ip, []) if t >= window_start]
+    ip_events.append(now)
+    REQUEST_TIMESTAMPS_BY_IP[client_ip] = ip_events
+    if len(ip_events) > RATE_LIMIT_MAX_REQUESTS:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": "Слишком много запросов", "code": "RATE_LIMITED"},
+        )
+
     started_at = datetime.now(timezone.utc)
     try:
         response = await call_next(request)
+        logger.info("HTTP %s %s from %s -> %s", request.method, request.url.path, client_ip, response.status_code)
         with SessionLocal() as db:
             create_log(
                 db=db,
                 level=LogLevel.info if response.status_code < 400 else LogLevel.warning,
                 source="http",
-                message=f"{request.method} {request.url.path} -> {response.status_code}",
+                message=f"{request.method} {request.url.path} from {client_ip} -> {response.status_code}",
                 extra_json={
-                    "duration_ms": int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                    "duration_ms": int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
+                    "client_ip": client_ip,
                 },
             )
         return response
     except Exception as exc:
+        logger.exception("HTTP failure %s %s from %s", request.method, request.url.path, client_ip)
         with SessionLocal() as db:
             create_log(
                 db=db,
                 level=LogLevel.error,
                 source="http",
                 message=f"Необработанная ошибка: {type(exc).__name__}",
-                extra_json={"path": request.url.path, "method": request.method},
+                extra_json={"path": request.url.path, "method": request.method, "client_ip": client_ip},
             )
         raise
 
@@ -1286,23 +1356,24 @@ def admin_reject_request(
 # =========================
 @app.get(
     "/health",
-    response_model=MessageResponse,
+    response_model=HealthResponse,
     tags=["Система"],
     summary="Проверка состояния сервера",
     description="Возвращает простой ответ о работоспособности API.",
 )
 def healthcheck():
-    return MessageResponse(message="OK")
+    return HealthResponse(status="ok", base_url=BASE_URL)
 
 
 # =========================
 # RUN
 # =========================
 # Запуск:
-# uvicorn service_bus_backend_main:app --reload
+# uvicorn service_bus_backend_main:app --host 0.0.0.0 --port 8000
+# gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:8000 service_bus_backend_main:app
 #
 # Зависимости:
-# pip install fastapi uvicorn sqlalchemy psycopg2-binary python-jose[cryptography] passlib[bcrypt] bcrypt==4.0.1 python-multipart
+# pip install fastapi uvicorn gunicorn sqlalchemy psycopg2-binary python-jose[cryptography] passlib[bcrypt] bcrypt==4.0.1 python-multipart
 #
 # Важно:
 # если у вас старая база и проблемы со входом, удалите service_bus.db и запустите сервер заново.
