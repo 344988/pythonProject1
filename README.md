@@ -51,3 +51,38 @@ http://37.200.79.56:8000/health
 }
 ```
 
+## Основные endpoint'ы
+
+- Auth: `POST /auth/login`
+- System: `GET /health`
+- Admin users: `GET/POST /admin/users`, `PATCH /admin/users/{user_id}/permissions`, `DELETE /admin/users/{user_id}`
+- Admin roles: `GET/POST /admin/roles`
+- Admin logs: `GET /admin/logs`, `GET /admin/logs/errors`, `POST /admin/logs`
+- Admin companies: `GET/POST /admin/companies`
+- Driver: `POST /route/start`, `POST /route/finish`, `POST /location/update`
+- Passenger/Customer: `GET /routes/active`, `GET /location/{user_id}`
+- Requests: `POST /requests`, `GET /admin/requests`, `POST /admin/requests/{id}/approve`, `POST /admin/requests/{id}/reject`
+
+## Auth flow
+
+1. Выполнить `POST /auth/login` (form-urlencoded: `username`, `password`; совместимо с `login` вместо `username`).
+2. В ответ получить `access_token`.
+3. Передавать `Authorization: Bearer <token>` для защищенных endpoint'ов.
+
+## Примеры curl
+
+```bash
+curl -X POST "http://37.200.79.56:8000/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=admin&password=admin123"
+```
+
+```bash
+curl "http://37.200.79.56:8000/health"
+```
+
+## Seed / миграции
+
+- При старте автоматически создаются таблицы SQLAlchemy.
+- Автоматически сидируются системные роли: `admin`, `driver`, `passenger`, `customer`.
+- Если отсутствует пользователь `admin`, он создается с паролем `admin123` (смените пароль в production).

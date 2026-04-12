@@ -10,8 +10,9 @@ from typing import Any, Generator, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, ConfigDict, Field
@@ -131,6 +132,21 @@ class UserRoleEntry(Base):
     code: Mapped[str] = mapped_column(String(100), primary_key=True)
     description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class Company(Base):
+    __tablename__ = "companies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class BusRequest(Base):
@@ -337,6 +353,8 @@ class MessageResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    timestamp: datetime
+    version: str
     base_url: str
 
 
@@ -351,6 +369,30 @@ class RoleRead(BaseModel):
     code: str
     description: Optional[str]
     is_system: bool
+
+
+class CompanyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    contact_name: Optional[str] = Field(default=None, max_length=255)
+    contact_phone: Optional[str] = Field(default=None, max_length=100)
+    is_active: bool = True
+
+
+class CompanyUpdate(BaseModel):
+    contact_name: Optional[str] = Field(default=None, max_length=255)
+    contact_phone: Optional[str] = Field(default=None, max_length=100)
+    is_active: Optional[bool] = None
+
+
+class CompanyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    contact_name: Optional[str]
+    contact_phone: Optional[str]
+    is_active: bool
+    created_at: datetime
 
 
 class BusRequestCreate(BaseModel):
@@ -457,6 +499,13 @@ def authenticate_user(db: Session, login: str, password: str) -> Optional[User]:
     if not verify_password(password, user.password_hash):
         return None
     return user
+
+
+async def parse_login_payload(request: Request) -> tuple[str, str]:
+    form = await request.form()
+    username = str(form.get("username") or form.get("login") or "").strip()
+    password = str(form.get("password") or "").strip()
+    return username, password
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
@@ -568,6 +617,14 @@ async def http_exception_handler(_: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": str(exc.detail), "code": "HTTP_ERROR"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(_: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"error": str(exc.errors()), "code": "VALIDATION_ERROR"},
     )
 
 
@@ -711,12 +768,13 @@ async def request_log_middleware(request: Request, call_next):
     response_model=TokenResponse,
     tags=["Авторизация"],
     summary="Вход в систему",
-    description="Принимает логин и пароль, возвращает JWT токен и роль пользователя.",
+    description="Принимает form-urlencoded (username/password, совместимо с login/password), возвращает JWT токен и роль пользователя.",
 )
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = authenticate_user(db, form_data.username, form_data.password)
+async def login(request: Request, db: Session = Depends(get_db)):
+    username, password = await parse_login_payload(request)
+    user = authenticate_user(db, username, password)
     if not user:
-        create_log(db, LogLevel.warning, "auth", f"Неудачная попытка входа: {form_data.username}")
+        create_log(db, LogLevel.warning, "auth", f"Неудачная попытка входа: {username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Неверный логин или пароль",
@@ -904,6 +962,49 @@ def admin_create_role(
     db.refresh(role)
     create_log(db, LogLevel.success, "admin.roles", f"Добавлена роль {code}", user_id=current_user.id)
     return RoleRead.model_validate(role)
+
+
+@app.get(
+    "/admin/companies",
+    response_model=list[CompanyRead],
+    tags=["Администрирование"],
+    summary="Список компаний",
+)
+def admin_list_companies(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(ROLE_ADMIN)),
+):
+    rows = db.scalars(select(Company).order_by(Company.id)).all()
+    return [CompanyRead.model_validate(row) for row in rows]
+
+
+@app.post(
+    "/admin/companies",
+    response_model=CompanyRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Администрирование"],
+    summary="Создать компанию",
+)
+def admin_create_company(
+    payload: CompanyCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(ROLE_ADMIN)),
+):
+    exists = db.scalar(select(Company).where(Company.name == payload.name.strip()))
+    if exists:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Компания уже существует")
+
+    item = Company(
+        name=payload.name.strip(),
+        contact_name=payload.contact_name,
+        contact_phone=payload.contact_phone,
+        is_active=payload.is_active,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    create_log(db, LogLevel.success, "admin.companies", f"Создана компания {item.name}", user_id=current_user.id)
+    return CompanyRead.model_validate(item)
 
 
 # =========================
@@ -1362,7 +1463,12 @@ def admin_reject_request(
     description="Возвращает простой ответ о работоспособности API.",
 )
 def healthcheck():
-    return HealthResponse(status="ok", base_url=BASE_URL)
+    return HealthResponse(
+        status="ok",
+        timestamp=datetime.now(timezone.utc),
+        version=app.version,
+        base_url=BASE_URL,
+    )
 
 
 # =========================
